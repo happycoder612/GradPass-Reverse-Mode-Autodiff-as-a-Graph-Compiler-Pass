@@ -19,10 +19,11 @@ A minimal tensor compiler pipeline in pure Python/NumPy. Instead of recording op
   run()   ── interpreter (NumPy kernels) ──►  numeric gradients
 ```
 
-1. **IR:** every computation is a `Node(op, inputs)`. Supported ops: `add`, `mul`, `matmul`, `relu`, `transpose`, `sum_all`, plus helper ops (`step`, `sum_to_like`, `broadcast_like`) that the AD pass emits.
+1. **IR:** every computation is a `Node(op, inputs)`. Supported ops: `add`, `mul`, `matmul`, `relu`, `exp`, `softmax`, `transpose`, `sum_all`, `sum_rows`, plus helper ops (`step`, `sum_to_like`, `broadcast_like`) that the AD pass emits.
 2. **Autodiff pass (`grad`):** walks the graph in reverse topological order. Each op has a local gradient rule, and the chain rule composes them. Gradients from multiple uses of the same node are summed, and broadcasting is undone with `sum_to_like`.
 3. **Optimization pass (`cse`):** merges structurally identical nodes in the generated backward graph.
 4. **Interpreter (`run`):** executes any graph with NumPy kernels.
+5. **Memory-aware executor (`run_mem`):** frees each intermediate array after its last use and reports peak intermediate memory. This is the measurement tool for the memory optimizations on the roadmap.
 
 ## Quick start
 
@@ -68,14 +69,16 @@ test_grad.py       gradient-checking and pass-correctness tests
 
 ## Limitations
 
-- Small op set; no softmax, conv, or indexing yet.
+- Small op set; no conv or indexing yet.
 - NumPy interpreter only: no code generation, so no speed-ups are claimed.
 - CSE is the only optimization pass so far.
 - Gradients are computed for a single scalar loss.
 
 ## Roadmap
 
-- [ ] More ops (`sub`, `div`, `exp`, `log`, `softmax`) with gradient rules and tests
+- [x] `exp` and `softmax` with gradient rules and tests
+- [x] Memory-aware executor that frees arrays after last use and measures peak memory
+- [ ] More ops (`sub`, `div`, `log`) with gradient rules and tests
 - [ ] Elementwise operator fusion pass on the backward graph
 - [ ] Rematerialization (recompute cheap activations instead of storing them) and a peak-memory measurement
 - [ ] Dead-code elimination and constant folding

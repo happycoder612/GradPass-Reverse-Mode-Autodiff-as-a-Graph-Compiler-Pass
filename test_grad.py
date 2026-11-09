@@ -13,8 +13,8 @@ import numpy as np
 import pytest
 
 from mini_autodiff import (
-    var, const, add, mul, matmul, relu, sum_all,
-    grad, cse, run, topo,
+    var, const, add, mul, matmul, relu, sum_all, exp, softmax,
+    grad, cse, run, run_mem, topo,
 )
 
 RNG = np.random.default_rng(42)
@@ -68,6 +68,38 @@ def test_relu():
     check(loss, [x], {"x": vals})
 
 
+def test_exp():
+    x = var("x")
+    loss = sum_all(exp(x))
+    vals = RNG.normal(size=(3, 4))
+    check(loss, [x], {"x": vals})
+    (g,) = run(grad(loss, [x]), {"x": vals})
+    assert np.allclose(g, np.exp(vals))            # d/dx exp(x) = exp(x)
+
+
+def test_softmax_forward_rows_sum_to_one():
+    x = var("x")
+    (out,) = run([softmax(x)], {"x": RNG.normal(size=(5, 7)) * 50})   # large values: stability check
+    assert np.allclose(out.sum(axis=-1), 1.0)
+    assert np.isfinite(out).all()
+
+
+def test_softmax_gradient():
+    # weight by w so the loss is not constant (rows of softmax always sum to 1)
+    x, w = var("x"), var("w")
+    loss = sum_all(mul(softmax(x), w))
+    feeds = {"x": RNG.normal(size=(4, 5)), "w": RNG.normal(size=(4, 5))}
+    check(loss, [x, w], feeds)
+
+
+def test_softmax_and_exp_compose():
+    # exp(softmax(x)) checks that the two new gradient rules chain correctly
+    x, t = var("x"), var("t")
+    loss = sum_all(mul(exp(softmax(x)), t))
+    feeds = {"x": RNG.normal(size=(3, 6)), "t": RNG.normal(size=(3, 6))}
+    check(loss, [x, t], feeds)
+
+
 def test_shared_node_gradients_accumulate():
     """x is used twice in x*x, so dL/dx must be 2x (both paths summed)."""
     x = var("x")
@@ -111,6 +143,50 @@ def test_cse_keeps_results_and_shrinks_graph():
     for a, b in zip(run(grads, feeds), run(opt, feeds)):
         assert np.allclose(a, b)
     assert len(topo(opt)) < len(topo(grads))
+
+
+def _mlp_graph():
+    x, y = var("x"), var("y")
+    W1, b1, W2, b2 = var("W1"), var("b1"), var("W2"), var("b2")
+    h = relu(add(matmul(x, W1), b1))
+    pred = add(matmul(h, W2), b2)
+    diff = add(pred, mul(const(-1.0), y))
+    loss = sum_all(mul(diff, diff))
+    feeds = {
+        "x": RNG.normal(size=(32, 8)), "y": RNG.normal(size=(32, 1)),
+        "W1": RNG.normal(size=(8, 16)), "b1": RNG.normal(size=(1, 16)),
+        "W2": RNG.normal(size=(16, 1)), "b2": RNG.normal(size=(1, 1)),
+    }
+    return loss, cse(grad(loss, [W1, b1, W2, b2])), feeds
+
+
+def test_run_mem_matches_run():
+    loss, grads, feeds = _mlp_graph()
+    expected = run([loss] + grads, feeds)
+    for free in (True, False):
+        got, _ = run_mem([loss] + grads, feeds, free=free)
+        for e, g in zip(expected, got):
+            assert np.allclose(e, g)
+
+
+def test_freeing_lowers_peak_memory():
+    loss, grads, feeds = _mlp_graph()
+    _, keep_all = run_mem([loss] + grads, feeds, free=False)
+    _, freed = run_mem([loss] + grads, feeds, free=True)
+    assert freed < keep_all
+
+
+def test_freeing_chain_peak_is_small():
+    """A long elementwise chain only ever needs ~2 live arrays when freeing."""
+    x = var("x")
+    node = x
+    for _ in range(10):
+        node = relu(node)
+    vals = RNG.normal(size=(100, 100))
+    _, keep_all = run_mem([node], {"x": vals}, free=False)
+    _, freed = run_mem([node], {"x": vals}, free=True)
+    assert keep_all == 10 * vals.nbytes
+    assert freed == 2 * vals.nbytes
 
 
 def test_unsupported_op_raises():

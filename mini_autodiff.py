@@ -23,6 +23,9 @@ def relu(a): return Node("relu", (a,))
 def step(a): return Node("step", (a,))            # relu'(x): 1 if x>0 else 0
 def transpose(a): return Node("transpose", (a,))
 def sum_all(a): return Node("sum_all", (a,))
+def exp(a): return Node("exp", (a,))
+def sum_rows(a): return Node("sum_rows", (a,))    # sum over last axis, keeps shape (n, 1)
+def softmax(a): return Node("softmax", (a,))      # row-wise softmax over last axis
 def sum_to_like(g, like): return Node("sum_to_like", (g, like))      # undo broadcasting
 def broadcast_like(g, like): return Node("broadcast_like", (g, like))
 
@@ -54,6 +57,11 @@ def _sum_to_like(g, like):
     return g
 
 
+def _softmax(a):
+    e = np.exp(a - a.max(axis=-1, keepdims=True))     # subtract max for numerical stability
+    return e / e.sum(axis=-1, keepdims=True)
+
+
 KERNELS = {
     "add": lambda a, b: a + b,
     "mul": lambda a, b: a * b,
@@ -62,6 +70,9 @@ KERNELS = {
     "step": lambda a: (a > 0).astype(float),
     "transpose": lambda a: a.T,
     "sum_all": lambda a: np.array(a.sum()),
+    "exp": np.exp,
+    "sum_rows": lambda a: a.sum(axis=-1, keepdims=True),
+    "softmax": _softmax,
     "sum_to_like": _sum_to_like,
     "broadcast_like": lambda g, like: np.broadcast_to(g, like.shape).copy(),
 }
@@ -77,6 +88,41 @@ def run(outputs, feeds):
         else:
             vals[id(n)] = KERNELS[n.op](*[vals[id(i)] for i in n.inputs])
     return [vals[id(o)] for o in outputs]
+
+
+def run_mem(outputs, feeds, free=True):
+    """Like run(), but tracks memory and (optionally) frees arrays after their last use.
+
+    Returns (output_values, peak_bytes). "Peak" counts only intermediate and output
+    arrays that the graph computes; the fed-in inputs and constants live outside
+    the graph either way, so they are left out.
+    free=False keeps everything alive until the end (what run() does).
+    """
+    order = topo(outputs)
+    last_use = {}
+    for i, n in enumerate(order):
+        for inp in n.inputs:
+            last_use[id(inp)] = i
+    keep = {id(o) for o in outputs}
+
+    vals, counted = {}, set()
+    live = peak = 0
+    for i, n in enumerate(order):
+        if n.op == "var":
+            vals[id(n)] = feeds[n.name]
+        elif n.op == "const":
+            vals[id(n)] = n.value
+        else:
+            vals[id(n)] = KERNELS[n.op](*[vals[id(j)] for j in n.inputs])
+            counted.add(id(n))
+            live += vals[id(n)].nbytes
+        peak = max(peak, live)               # inputs are still alive while a node computes
+        if free:
+            for j in {id(inp) for inp in n.inputs}:
+                if last_use[j] == i and j not in keep and j in counted:
+                    live -= vals.pop(j).nbytes
+                    counted.discard(j)
+    return [vals[id(o)] for o in outputs], peak
 
 
 # ------------------------------------------- 3 + 4. the autodiff compiler pass
@@ -112,6 +158,17 @@ def grad(loss, wrt):
         elif n.op == "sum_all":
             (a,) = n.inputs
             acc(a, broadcast_like(dz, a))
+        elif n.op == "exp":
+            (a,) = n.inputs
+            acc(a, mul(dz, n))                         # d exp(a) = exp(a): reuse the forward node
+        elif n.op == "sum_rows":
+            (a,) = n.inputs
+            acc(a, broadcast_like(dz, a))
+        elif n.op == "softmax":
+            (a,) = n.inputs
+            # dx = s * (dz - sum(dz * s)), where s = softmax(x) is the forward node itself
+            inner = sum_rows(mul(dz, n))
+            acc(a, mul(n, add(dz, mul(const(-1.0), inner))))
         else:
             raise NotImplementedError(f"no gradient rule for {n.op}")
     return [g[id(w)] for w in wrt]
@@ -192,3 +249,9 @@ if __name__ == "__main__":
             P[name] -= 0.001 * gr
         if step_i % 100 == 0:
             print(f"step {step_i:3d}  loss {float(out[0]):.3f}")
+
+    # Memory: keep-everything executor vs. free-after-last-use executor
+    feeds = {"x": Xtr, "y": Ytr, **P}
+    _, peak_keep = run_mem([loss] + opt_grads, feeds, free=False)
+    _, peak_free = run_mem([loss] + opt_grads, feeds, free=True)
+    print(f"peak intermediate memory: {peak_keep} B (keep all) -> {peak_free} B (free after last use)")
